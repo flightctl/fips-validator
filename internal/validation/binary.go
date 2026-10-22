@@ -5,6 +5,8 @@ import (
 	"debug/buildinfo"
 	"debug/elf"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -23,9 +25,15 @@ type versionConstrainedReqs struct {
 var (
 	requiredSymbolsForGoVersions = []versionConstrainedReqs{
 		{
-			versions: newSemverConstraint(">= 1.23"),
+			versions: newSemverConstraint(">= 1.23, < 1.27"),
 			requirements: []string{
 				"vendor/github.com/golang-fips/openssl/v2.dlopen",
+			},
+		},
+		{
+			versions: newSemverConstraint(">= 1.27, < 1.28"),
+			requirements: []string{
+				"go:fipsinfo",
 			},
 		},
 	}
@@ -46,19 +54,25 @@ func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc f
 	red := color.New(color.Bold, color.FgRed).SprintfFunc()
 
 	fmt.Printf("• validating binary %s... ", path)
+	if isScript(filepath.Join(rootPath, path)) {
+		fmt.Printf("skipped (shell script)\n")
+		return true
+	}
 
 	ei, err := elfinfo.ReadFile(filepath.Join(rootPath, path))
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "bad magic number '[35 33") {
-			fmt.Printf("skipped (shell script)\n")
-		} else {
-			fmt.Printf("skipped (failed to read ELF info: %v)\n", err)
-		}
-		return true // Skip is considered success
+		failure("failed to read ELF info: %v\n", err)
+		return false
 	}
 	if !ei.IsElf {
 		fmt.Printf("skipped (not an ELF executable)\n")
 		return true // Skip is considered success
+	}
+	if len(ei.Symbols) == 0 {
+		if _, err := buildinfo.ReadFile(filepath.Join(rootPath, path)); err == nil {
+			failure("cannot validate Go binary without ELF symbols\n")
+			return false
+		}
 	}
 	if !usesCrypto(ei, debugFunc) {
 		fmt.Printf("skipped (no crypto)\n")
@@ -82,6 +96,7 @@ func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc f
 			errs = append(errs, validateCgoInit(ei)...)
 			errs = append(errs, validateGoSymbols(ei, goVersion)...)
 			errs = append(errs, validateGoTagsAndExperiment(bi)...)
+			errs = append(errs, validateGoBackend(bi, goVersion)...)
 		}
 	}
 
@@ -94,6 +109,17 @@ func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc f
 	}
 	success("success\n")
 	return true
+}
+
+func isScript(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	var magic [2]byte
+	_, err = io.ReadFull(file, magic[:])
+	return err == nil && string(magic[:]) == "#!"
 }
 
 func usesCrypto(info *elfinfo.ElfInfo, debugFunc func(string, ...interface{})) bool {
@@ -188,11 +214,39 @@ func validateGoTagsAndExperiment(info *buildinfo.BuildInfo) []error {
 		}
 	}
 
+	strict := false
 	for _, bs := range info.Settings {
-		if bs.Key == "GOEXPERIMENT" && !strings.Contains(bs.Value, "strictfipsruntime") {
-			errs = append(errs, fmt.Errorf("missing required GOEXPERIMENT value 'strictfipsruntime'"))
+		if bs.Key == "GOEXPERIMENT" {
+			for _, experiment := range strings.Split(bs.Value, ",") {
+				switch experiment {
+				case "strictfipsruntime":
+					strict = true
+				case "none", "nostrictfipsruntime":
+					strict = false
+				}
+			}
 		}
+	}
+	if !strict {
+		errs = append(errs, fmt.Errorf("missing required GOEXPERIMENT value 'strictfipsruntime'"))
 	}
 
 	return errs
+}
+
+func validateGoBackend(info *buildinfo.BuildInfo, goVersion *semver.Version) []error {
+	snapshot := ""
+	for _, setting := range info.Settings {
+		if setting.Key == "GOFIPS140" {
+			snapshot = setting.Value
+		}
+	}
+	if newSemverConstraint(">= 1.27, < 1.28").Check(goVersion) {
+		if snapshot != "v1.0.0-c2097c7c" {
+			return []error{fmt.Errorf("unsupported native FIPS snapshot %q; require GOFIPS140=v1.0.0-c2097c7c", snapshot)}
+		}
+	} else if snapshot != "" && snapshot != "off" {
+		return []error{fmt.Errorf("native FIPS snapshot is unsupported for Go %s", goVersion)}
+	}
+	return nil
 }
