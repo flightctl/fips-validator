@@ -4,6 +4,7 @@ import (
 	"context"
 	"debug/buildinfo"
 	"debug/elf"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -39,6 +40,17 @@ func newSemverConstraint(str string) *semver.Constraints {
 	return c
 }
 
+func parseGoVersion(version string) (*semver.Version, error) {
+	version = strings.TrimPrefix(version, "go")
+	if i := strings.IndexByte(version, ' '); i != -1 {
+		version = version[:i]
+	}
+	if i := strings.Index(version, "-X:"); i != -1 {
+		version = version[:i]
+	}
+	return semver.NewVersion(version)
+}
+
 func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc func(string, ...interface{})) bool {
 	var errs []error
 	success := color.New(color.Bold, color.FgGreen).PrintfFunc()
@@ -49,6 +61,13 @@ func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc f
 
 	ei, err := elfinfo.ReadFile(filepath.Join(rootPath, path))
 	if err != nil {
+		// Symbol extraction failed for a recognized executable. Treat this as
+		// a validation failure, rather than skipping it as an unknown file.
+		if errors.Is(err, elfinfo.ErrSymbols) {
+			failure("failed\n")
+			fmt.Printf("  %s %v\n", red("✘"), err)
+			return false
+		}
 		if strings.HasPrefix(err.Error(), "bad magic number '[35 33") {
 			fmt.Printf("skipped (shell script)\n")
 		} else {
@@ -64,20 +83,19 @@ func ValidateBinary(_ context.Context, rootPath string, path string, debugFunc f
 		fmt.Printf("skipped (no crypto)\n")
 		return true // Skip is considered success
 	}
-	errs = append(errs, validateNotStaticallyLinked(ei)...)
 
 	bi, err := buildinfo.ReadFile(filepath.Join(rootPath, path))
 	if err != nil {
+		errs = append(errs, validateNotStaticallyLinked(ei)...)
 		debugFunc("skipping further validation (not a Go binary): %v", err)
 	} else {
-		ver := strings.TrimPrefix(bi.GoVersion, "go")
-		if i := strings.IndexByte(ver, ' '); i != -1 {
-			ver = ver[:i]
-		}
-		goVersion, err := semver.NewVersion(ver)
+		goVersion, err := parseGoVersion(bi.GoVersion)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to parse Go version %q: %v", bi.GoVersion, err))
+		} else if goVersion.Major() == 1 && goVersion.Minor() >= 27 {
+			errs = append(errs, validateNativeGo(bi, ei)...)
 		} else {
+			errs = append(errs, validateNotStaticallyLinked(ei)...)
 			errs = append(errs, validateCgoEnabled(bi)...)
 			errs = append(errs, validateCgoInit(ei)...)
 			errs = append(errs, validateGoSymbols(ei, goVersion)...)

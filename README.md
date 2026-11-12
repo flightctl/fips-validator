@@ -4,13 +4,13 @@ Tool for validating that a binary, an RPM package, or an OCI container image has
 
 ## Description
 
-`fips-validator` validates that all binaries in the input that use cryptographic algorithms are dynamically linked against an OpenSSL library built with FIPS support. This also applies to Golang binaries, as the upstream Go crypto libraries have not yet been FIPS-verified. For container images, the tool further checks that OpenSSL's `libcrypto.so` is present in the image.
+`fips-validator` validates cryptographic binaries using either Go's native certified FIPS module or OpenSSL's FIPS provider. Go 1.27+ binaries can use the native module; older Go binaries and non-Go binaries continue to require OpenSSL-backed crypto. For container images, the tool also checks that OpenSSL's `libcrypto.so` is present in the image.
 
-To build a Golang binary with FIPS-verified crypto
+To build a Go binary with FIPS-verified crypto:
 
-- use a Golang toolchain >=1.23 that has been patched to use OpenSSL for crypto operations, e.g. using the toolchain provided by the `registry.access.redhat.com/ubi9/go-toolset:latest` image
-- provide the `CGO_ENABLED=1` and `GOEXPERIMENT=strictfipsruntime` environment variables when building
-- avoid using the `no_openssl` build tag
+- With Go 1.27+, set `GOFIPS140=v1.0.0` to select the certified native Go FIPS module. The validator requires the binary to enable FIPS mode by default or on FIPS-enabled hosts and to contain the module integrity information.
+- With Go 1.23–1.26, use a toolchain patched to use OpenSSL for crypto operations, such as the toolchain provided by the `registry.access.redhat.com/ubi9/go-toolset:latest` image. Set `CGO_ENABLED=1` and `GOEXPERIMENT=strictfipsruntime` when building.
+- Avoid the `no_openssl` build tag when using OpenSSL-backed Go crypto.
 
 ## Installation
 
